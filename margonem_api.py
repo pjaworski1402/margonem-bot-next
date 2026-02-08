@@ -131,6 +131,148 @@ class MargonemAPI:
         except Exception:
             return {}
 
+    def _parse_percent_from_span_text(self, text):
+        if not (text or "").strip().endswith("%"):
+            return None
+        pct = int("".join(c for c in (text or "") if c.isdigit()) or "0")
+        return min(100, max(0, pct))
+
+    def get_hp_percent_from_dom(self):
+        """
+        Odczytuje aktualny % HP z paska w interfejsie (span.value z %).
+        Zawsze odpowiada temu, co gra pokazuje. Zwraca int 0–100 lub None.
+        Szuka w głównym dokumencie (xpath lub span.value) oraz w iframe gry.
+        """
+        def find_in_current():
+            try:
+                for el in self.driver.find_elements("css selector", "span.value"):
+                    pct = self._parse_percent_from_span_text(el.text)
+                    if pct is not None:
+                        return pct
+            except Exception:
+                pass
+            return None
+        try:
+            self.driver.switch_to.default_content()
+            try:
+                el = self.driver.find_element(
+                    "xpath",
+                    "/html/body/div/div[4]/div[8]/div[5]/div[5]/div[3]/div/div[1]/div[3]/span"
+                )
+                pct = self._parse_percent_from_span_text(el.text)
+                if pct is not None:
+                    return pct
+            except Exception:
+                pass
+            pct = find_in_current()
+            if pct is not None:
+                return pct
+            if ensure_game_context(self.driver):
+                pct = find_in_current()
+                if pct is not None:
+                    return pct
+            return None
+        except Exception:
+            return None
+        finally:
+            self.ensure_context()
+
+    def get_hero_hp_for_heal(self):
+        """
+        Zwraca dict: visual_hp, visual_maxhp (do wyboru mikstury – ile HP brakuje).
+        Używaj get_hp_percent_from_dom() do decyzji „czy leczyć” – tam jest zawsze poprawny %.
+        """
+        self.ensure_context()
+        try:
+            return self.driver.execute_script(
+                """
+                if (!Engine || !Engine.hero) return null;
+                var data = (typeof Engine.hero.getData === 'function') ? Engine.hero.getData() : Engine.hero.d;
+                if (!data) return null;
+                var visualHP = parseInt(data.hp, 10) || 0;
+                var visualMax = parseInt(data.maxhp, 10) || 1;
+                return { visual_hp: visualHP, visual_maxhp: visualMax };
+                """
+            ) or {}
+        except Exception:
+            return {}
+
+    def get_heal_potions(self):
+        """
+        Lista mikstur do leczenia z ekwipunku (lokacja "g").
+        Każdy element: {id, name, val, type} gdzie type to "heal" (leczy N) lub "full" (fullheal).
+        """
+        self.ensure_context()
+        try:
+            raw = self.driver.execute_script(
+                """
+                if (!Engine || !Engine.items || typeof Engine.items.fetchLocationItems !== 'function') return [];
+                var raw = Engine.items.fetchLocationItems('g') || [];
+                var res = [];
+                for (var i = 0; i < raw.length; i++) {
+                    var it = raw[i];
+                    var obj = (it.i != null) ? it.i : it;
+                    var s = (obj._cachedStats != null) ? obj._cachedStats : (it._cachedStats || {});
+                    if (s.leczy != null) res.push({ id: obj.id, name: (obj.name || ''), val: parseInt(s.leczy, 10) || 0, type: 'heal' });
+                    if (s.fullheal != null) res.push({ id: obj.id, name: (obj.name || ''), val: 999999, type: 'full' });
+                }
+                return res;
+                """
+            )
+            return raw if isinstance(raw, list) else []
+        except Exception:
+            return []
+
+    def use_item_to_quick_slot(self, item_id, slot=1):
+        """Użycie przedmiotu (mikstura) – przeniesienie do slotu szybkiego i użycie: moveitem&st=1&id=ID."""
+        self._g("moveitem&st=" + str(int(slot)) + "&id=" + str(int(item_id)))
+
+    def try_autoheal_tick(self, heal_below_pct, stop_min_pct, stop_max_pct, log_callback=None):
+        """
+        Jedno sprawdzenie autoheal. % HP brany z DOM (span.value z %) – zawsze zgodny z tym, co gra pokazuje.
+        Jeśli % < heal_below_pct i nie w zakresie stop – wybiera miksturę i pije.
+        """
+        def log(msg):
+            if log_callback:
+                log_callback(msg)
+        pct = self.get_hp_percent_from_dom()
+        if pct is None:
+            data = self.get_hero_hp_for_heal()
+            if data and data.get("visual_maxhp"):
+                visual_hp = data.get("visual_hp") or 0
+                visual_max = data.get("visual_maxhp") or 1
+                pct = (visual_hp * 100) // visual_max if visual_max else 0
+            else:
+                return True
+        if pct >= stop_min_pct and pct <= stop_max_pct:
+            return True
+        if pct >= heal_below_pct:
+            return True
+        data = self.get_hero_hp_for_heal()
+        if not data:
+            return True
+        visual_hp = data.get("visual_hp") or 0
+        visual_max = data.get("visual_maxhp") or 1
+        missing = visual_max - visual_hp
+        log("AutoHeal: HP {}% (z paska) – szukam mikstury.".format(pct))
+        pots = self.get_heal_potions()
+        if not pots:
+            log("AutoHeal: brak mikstur!")
+            return True
+        pots_sorted = sorted(pots, key=lambda p: p.get("val") or 0, reverse=True)
+        chosen = None
+        for p in pots_sorted:
+            if (p.get("val") or 0) <= missing:
+                chosen = p
+                break
+        if not chosen:
+            pots_sorted_asc = sorted(pots, key=lambda p: p.get("val") or 0)
+            chosen = pots_sorted_asc[0] if pots_sorted_asc else None
+        if chosen:
+            log("AutoHeal: piję {} (moc: {}).".format(chosen.get("name", "?"), chosen.get("val", 0)))
+            self.use_item_to_quick_slot(chosen["id"], slot=1)
+        return True
+
     def hero_auto_go_to(self, x, y):
         """Wysyła bohatera do kratki (x, y). Nie czeka na dojście."""
         self.ensure_context()
@@ -354,6 +496,51 @@ class MargonemAPI:
                 time.sleep(check_interval)
             time.sleep(0.3)
 
+    def wander_randomly_for_seconds(
+        self, seconds, check_interval=0.5, cancel_check=None, pause_check=None
+    ):
+        """
+        Chodzi losowo po aktualnej mapie przez podaną liczbę sekund.
+        Przerywa gdy cancel_check() == True. Pauza: pause_check() – wtedy tylko czeka.
+        """
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if cancel_check and cancel_check():
+                return
+            while pause_check and pause_check():
+                time.sleep(0.3)
+                if cancel_check and cancel_check():
+                    return
+            mi = self.get_map_info()
+            sx, sy = mi.get("size_x"), mi.get("size_y")
+            pos = self.get_hero_position()
+            if sx and sy and sx > 4 and sy > 4:
+                rx = random.randint(2, max(2, int(sx) - 2))
+                ry = random.randint(2, max(2, int(sy) - 2))
+            elif pos:
+                rx = max(0, pos[0] + random.randint(-4, 4))
+                ry = max(0, pos[1] + random.randint(-4, 4))
+            else:
+                time.sleep(check_interval)
+                continue
+            if not self.can_act():
+                time.sleep(check_interval)
+                continue
+            self.hero_auto_go_to(rx, ry)
+            step_deadline = time.time() + min(8, max(0, deadline - time.time()))
+            while time.time() < step_deadline:
+                if cancel_check and cancel_check():
+                    return
+                while pause_check and pause_check():
+                    time.sleep(0.3)
+                    if cancel_check and cancel_check():
+                        return
+                pos = self.get_hero_position()
+                if pos and self._distance_manhattan(pos[0], pos[1], rx, ry) <= 2:
+                    break
+                time.sleep(check_interval)
+            time.sleep(0.3)
+
     # --- Locks (Engine.lock) ---
 
     def is_locked(self, lock_type=None):
@@ -430,15 +617,30 @@ class MargonemAPI:
         """Wysyła bohatera do (x, y). Nie czeka."""
         self.hero_auto_go_to(int(x), int(y))
 
-    def wait_until_near(self, target_x, target_y, distance=1, timeout_sec=20, check_interval=0.4):
+    def wait_until_near(
+        self,
+        target_x,
+        target_y,
+        distance=1,
+        timeout_sec=120,
+        stuck_no_move_sec=25,
+        check_interval=0.4,
+    ):
         """
         Czeka aż bohater będzie w odległości <= distance (Manhattan) od (target_x, target_y).
-        Zwraca True jeśli dojdzie, False przy timeout.
+        Timeout tylko gdy: postać nie rusza się przez stuck_no_move_sec (utknęła)
+        albo upłynie łącznie timeout_sec. Dopóki postać zmienia pozycję, czekamy.
         """
-        deadline = time.time() + timeout_sec
-        while time.time() < deadline:
+        start = time.time()
+        last_pos = None
+        last_move_time = time.time()
+        while True:
             if self._maybe_solve_captcha():
                 self.log("Przerwano (zagadka – za mało prób).")
+                return False
+            elapsed = time.time() - start
+            if elapsed >= timeout_sec:
+                self.log("Timeout: przekroczono łączny czas {} s.".format(timeout_sec))
                 return False
             pos = self.get_hero_position()
             if pos is None:
@@ -447,9 +649,13 @@ class MargonemAPI:
             if self._distance_manhattan(pos[0], pos[1], target_x, target_y) <= distance:
                 self.log("Dojście do ({}, {}) – pozycja ({}, {}).".format(target_x, target_y, pos[0], pos[1]))
                 return True
+            if last_pos is None or (pos[0], pos[1]) != (last_pos[0], last_pos[1]):
+                last_move_time = time.time()
+                last_pos = pos
+            if time.time() - last_move_time >= stuck_no_move_sec:
+                self.log("Postać utknęła (brak ruchu od {} s) – przerywam.".format(stuck_no_move_sec))
+                return False
             time.sleep(check_interval)
-        self.log("Timeout: bohater nie dojrzał do celu.")
-        return False
 
     def _normalize_map_id(self, mid):
         """ID mapy do porównania (int lub string)."""
@@ -507,7 +713,9 @@ class MargonemAPI:
         gx, gy = gate.get("x"), gate.get("y")
         self.log("Przejście przez bramę {} do mapy {} – idę do ({}, {}).".format(gateway_id, target_map_id, gx, gy))
         self.hero_auto_go_to(gx, gy)
-        if not self.wait_until_near(gx, gy, distance=1, timeout_sec=move_timeout_sec):
+        if not self.wait_until_near(
+            gx, gy, distance=1, timeout_sec=120, stuck_no_move_sec=move_timeout_sec or 25
+        ):
             return False
         return self.wait_for_map_change(target_map_id, timeout_sec=map_change_timeout_sec)
 

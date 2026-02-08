@@ -19,6 +19,7 @@ from maps_graph import (
     get_map_name_by_id,
     get_maps_with_npc,
     get_maps_with_npc_by_distance,
+    get_neighbor_map_ids,
 )
 from captcha_solver import check_and_solve_captcha_once, ensure_no_captcha
 
@@ -92,6 +93,7 @@ def get_driver():
 
 
 _captcha_log_callback = None
+_auto_captcha_enabled = True  # włącz/wyłącz w zakładce Auto
 
 
 def set_driver(d, log_callback=None):
@@ -107,10 +109,10 @@ def set_driver(d, log_callback=None):
 
 def _captcha_watcher_loop(driver, stop_event):
     """W tle co 2.5 s sprawdza captcha; gdy „próby” < 2 – przestaje próbować."""
-    global _captcha_gave_up, _captcha_log_callback
+    global _captcha_gave_up, _captcha_log_callback, _auto_captcha_enabled
     import time
     while not stop_event.wait(timeout=2.5):
-        if _captcha_gave_up:
+        if _captcha_gave_up or not _auto_captcha_enabled:
             continue
         try:
             def log_cb(msg):
@@ -248,11 +250,34 @@ class MainWindow:
         self._notebook.add(tab_debug, text="Debug")
         self._build_debug_tab(tab_debug)
 
+        # Zakładka: Auto (captcha + autoheal)
+        tab_auto = ttk.Frame(self._notebook, padding=10)
+        self._notebook.add(tab_auto, text="Auto")
+        self._build_auto_tab(tab_auto)
+
         # Wspólny log na dole
         log_frame = ttk.LabelFrame(self.root, text="Log", padding=4)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         self._log = scrolledtext.ScrolledText(log_frame, height=8, state=tk.DISABLED, wrap=tk.WORD, font=("Consolas", 9))
         self._log.pack(fill=tk.BOTH, expand=True)
+
+    def _debug_accordion_toggle(self, index):
+        """Rozwija sekcję o danym indeksie, zwija pozostałe. Klik w rozwiniętą zwija ją."""
+        titles = self._debug_accordion_titles
+        if index == self._debug_accordion_expanded:
+            # Klik w już rozwiniętą – zwiń
+            self._debug_accordion_sections[index][1].pack_forget()
+            self._debug_accordion_sections[index][0].config(text="▶ " + titles[index])
+            self._debug_accordion_expanded = -1
+            return
+        for i, (btn, body) in enumerate(self._debug_accordion_sections):
+            if i == index:
+                body.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+                btn.config(text="▼ " + titles[i])
+            else:
+                body.pack_forget()
+                btn.config(text="▶ " + titles[i])
+        self._debug_accordion_expanded = index
 
     def _build_debug_tab(self, parent):
         self._processes = {}  # process_id -> {name, cancel, pause, target_map_id, target_map_name, enemy_name, attack_loop}
@@ -266,18 +291,38 @@ class MainWindow:
         right_f = ttk.Frame(paned, width=220)
         paned.add(right_f, weight=0)
 
-        # === Lewa kolumna: dotychczasowa zawartość Debug ===
-        # Status (odśwież)
-        status_f = ttk.LabelFrame(left_f, text="Status gry", padding=8)
-        status_f.pack(fill=tk.X, pady=(0, 8))
-        self._debug_status_text = tk.StringVar(value="Kliknij 'Odśwież status', gdy postać jest w grze.")
-        ttk.Label(status_f, textvariable=self._debug_status_text).pack(anchor=tk.W)
-        ttk.Button(status_f, text="Odśwież status", command=self._debug_refresh_status).pack(anchor=tk.W, pady=(4, 0))
+        # === Lewa kolumna: accordion (rozwijane sekcje, tylko jedna na raz) ===
+        accordion_root = ttk.Frame(left_f)
+        accordion_root.pack(fill=tk.BOTH, expand=True)
+        self._debug_accordion_titles = [
+            "Status gry",
+            "Idź do (x, y)",
+            "Atak – mapy z przeciwnikami",
+            "Rozmawiaj z NPC",
+            "Idź na mapę (BFS)",
+            "Mapa / NPC",
+        ]
+        self._debug_accordion_sections = []
+        self._debug_accordion_expanded = 0
 
-        # Idź do (x, y)
-        go_f = ttk.LabelFrame(left_f, text="Idź do pozycji (x, y)", padding=8)
-        go_f.pack(fill=tk.X, pady=(0, 8))
-        row = ttk.Frame(go_f)
+        # --- 1. Status gry ---
+        sec1_f = ttk.Frame(accordion_root)
+        sec1_f.pack(fill=tk.X, pady=(0, 2))
+        btn1 = ttk.Button(sec1_f, text="▼ " + self._debug_accordion_titles[0], command=lambda: self._debug_accordion_toggle(0))
+        btn1.pack(fill=tk.X)
+        body1 = ttk.LabelFrame(sec1_f, text="", padding=8)
+        self._debug_status_text = tk.StringVar(value="Kliknij 'Odśwież status', gdy postać jest w grze.")
+        ttk.Label(body1, textvariable=self._debug_status_text).pack(anchor=tk.W)
+        ttk.Button(body1, text="Odśwież status", command=self._debug_refresh_status).pack(anchor=tk.W, pady=(4, 0))
+        self._debug_accordion_sections.append((btn1, body1))
+
+        # --- 2. Idź do (x, y) ---
+        sec2_f = ttk.Frame(accordion_root)
+        sec2_f.pack(fill=tk.X, pady=(0, 2))
+        btn2 = ttk.Button(sec2_f, text="▶ " + self._debug_accordion_titles[1], command=lambda: self._debug_accordion_toggle(1))
+        btn2.pack(fill=tk.X)
+        body2 = ttk.Frame(sec2_f, padding=8)
+        row = ttk.Frame(body2)
         row.pack(anchor=tk.W)
         ttk.Label(row, text="X:").pack(side=tk.LEFT, padx=(0, 4))
         self._debug_x_var = tk.StringVar(value="0")
@@ -286,28 +331,27 @@ class MainWindow:
         self._debug_y_var = tk.StringVar(value="0")
         ttk.Entry(row, textvariable=self._debug_y_var, width=6).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Button(row, text="Idź", command=self._debug_go_xy).pack(side=tk.LEFT)
+        self._debug_accordion_sections.append((btn2, body2))
 
-        # Atak – mapy z przeciwnikami (pogrupowane wg odległości) + scroll
-        atk_f = ttk.LabelFrame(left_f, text="Atak – wybierz mapę z przeciwnikami", padding=8)
-        atk_f.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-        row_atk = ttk.Frame(atk_f)
+        # --- 3. Atak – mapy z przeciwnikami ---
+        sec3_f = ttk.Frame(accordion_root)
+        sec3_f.pack(fill=tk.X, pady=(0, 2))
+        btn3 = ttk.Button(sec3_f, text="▶ " + self._debug_accordion_titles[2], command=lambda: self._debug_accordion_toggle(2))
+        btn3.pack(fill=tk.X)
+        body3 = ttk.Frame(sec3_f, padding=8)
+        row_atk = ttk.Frame(body3)
         row_atk.pack(fill=tk.X)
         ttk.Label(row_atk, text="Nazwa przeciwnika:").pack(side=tk.LEFT, padx=(0, 6))
         self._debug_attack_name_var = tk.StringVar(value="Szczur")
         ttk.Entry(row_atk, textvariable=self._debug_attack_name_var, width=20).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(row_atk, text="Szukaj map", command=self._debug_attack_search_maps).pack(side=tk.LEFT, padx=(0, 12))
         self._debug_attack_loop_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(atk_f, text="Bij w pętli (pokonaj jednego → idź do następnego, w kółko)", variable=self._debug_attack_loop_var).pack(anchor=tk.W, pady=(4, 0))
-        # Obszar ze scrollem (Canvas + Scrollbar)
-        atk_scroll_f = ttk.Frame(atk_f)
+        ttk.Checkbutton(body3, text="Bij w pętli", variable=self._debug_attack_loop_var).pack(anchor=tk.W, pady=(4, 0))
+        atk_scroll_f = ttk.Frame(body3)
         atk_scroll_f.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
         self._attack_maps_scrollbar = ttk.Scrollbar(atk_scroll_f)
         self._attack_maps_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self._attack_maps_canvas = tk.Canvas(
-            atk_scroll_f,
-            yscrollcommand=self._attack_maps_scrollbar.set,
-            highlightthickness=0,
-        )
+        self._attack_maps_canvas = tk.Canvas(atk_scroll_f, yscrollcommand=self._attack_maps_scrollbar.set, highlightthickness=0)
         self._attack_maps_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._attack_maps_scrollbar.config(command=self._attack_maps_canvas.yview)
         self._attack_maps_container = ttk.Frame(self._attack_maps_canvas)
@@ -319,46 +363,66 @@ class MainWindow:
         self._attack_maps_container.bind("<Configure>", _on_attack_maps_frame_configure)
         self._attack_maps_canvas.bind("<Configure>", _on_attack_maps_canvas_configure)
         self._attack_maps_canvas.bind("<MouseWheel>", lambda e: self._attack_maps_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
-        ttk.Label(self._attack_maps_container, text="Wpisz nazwę i kliknij „Szukaj map” – klik w mapę: idź tam i atakuj najbliższego przeciwnika.").pack(anchor=tk.W)
+        ttk.Label(self._attack_maps_container, text="Wpisz nazwę i „Szukaj map” – klik w mapę: idź i atakuj.").pack(anchor=tk.W)
+        self._debug_accordion_sections.append((btn3, body3))
 
-        # Rozmawiaj z NPC po nazwie
-        talk_f = ttk.LabelFrame(left_f, text="Rozmawiaj z NPC (po nazwie)", padding=8)
-        talk_f.pack(fill=tk.X, pady=(0, 8))
-        row_talk = ttk.Frame(talk_f)
+        # --- 4. Rozmawiaj z NPC ---
+        sec4_f = ttk.Frame(accordion_root)
+        sec4_f.pack(fill=tk.X, pady=(0, 2))
+        btn4 = ttk.Button(sec4_f, text="▶ " + self._debug_accordion_titles[3], command=lambda: self._debug_accordion_toggle(3))
+        btn4.pack(fill=tk.X)
+        body4 = ttk.Frame(sec4_f, padding=8)
+        row_talk = ttk.Frame(body4)
         row_talk.pack(anchor=tk.W)
         self._debug_talk_name_var = tk.StringVar(value="")
         ttk.Entry(row_talk, textvariable=self._debug_talk_name_var, width=24).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(row_talk, text="Podejdź i rozmawiaj", command=self._debug_talk_by_name).pack(side=tk.LEFT)
+        self._debug_accordion_sections.append((btn4, body4))
 
-        # Idź na mapę (BFS)
-        nav_f = ttk.LabelFrame(left_f, text="Idź na mapę (ścieżka BFS)", padding=8)
-        nav_f.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-        ttk.Label(nav_f, text="Obecna mapa odczytana przy starcie nawigacji.").pack(anchor=tk.W)
-        row_search = ttk.Frame(nav_f)
+        # --- 5. Idź na mapę (BFS) ---
+        sec5_f = ttk.Frame(accordion_root)
+        sec5_f.pack(fill=tk.X, pady=(0, 2))
+        btn5 = ttk.Button(sec5_f, text="▶ " + self._debug_accordion_titles[4], command=lambda: self._debug_accordion_toggle(4))
+        btn5.pack(fill=tk.X)
+        body5 = ttk.Frame(sec5_f, padding=8)
+        ttk.Label(body5, text="Obecna mapa odczytana przy starcie nawigacji.").pack(anchor=tk.W)
+        row_search = ttk.Frame(body5)
         row_search.pack(fill=tk.X, pady=(4, 2))
         ttk.Label(row_search, text="Szukaj mapy:").pack(side=tk.LEFT, padx=(0, 6))
         self._debug_map_search_var = tk.StringVar(value="")
         self._debug_map_search_var.trace_add("write", lambda *a: self._debug_filter_maps())
         ttk.Entry(row_search, textvariable=self._debug_map_search_var, width=30).pack(side=tk.LEFT, padx=(0, 8))
-        list_frame = ttk.Frame(nav_f)
+        list_frame = ttk.Frame(body5)
         list_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 6))
         scroll = ttk.Scrollbar(list_frame)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self._debug_maps_listbox = tk.Listbox(list_frame, height=8, yscrollcommand=scroll.set, font=("Consolas", 9))
         self._debug_maps_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.config(command=self._debug_maps_listbox.yview)
-        self._debug_maps_filtered = []  # lista (map_id, name)
-        row_btn = ttk.Frame(nav_f)
+        self._debug_maps_filtered = []
+        row_btn = ttk.Frame(body5)
         row_btn.pack(anchor=tk.W)
         ttk.Button(row_btn, text="Idź na mapę", command=self._debug_navigate_to_map).pack(side=tk.LEFT, padx=(0, 8))
         self._debug_filter_maps()
+        self._debug_accordion_sections.append((btn5, body5))
 
-        # Lista NPC
-        list_f = ttk.LabelFrame(left_f, text="Mapa / NPC", padding=8)
-        list_f.pack(fill=tk.X, pady=(0, 8))
-        ttk.Button(list_f, text="Wylistuj wszystkich NPC na mapie", command=self._debug_list_npcs).pack(anchor=tk.W)
+        # --- 6. Mapa / NPC ---
+        sec6_f = ttk.Frame(accordion_root)
+        sec6_f.pack(fill=tk.X, pady=(0, 2))
+        btn6 = ttk.Button(sec6_f, text="▶ " + self._debug_accordion_titles[5], command=lambda: self._debug_accordion_toggle(5))
+        btn6.pack(fill=tk.X)
+        body6 = ttk.Frame(sec6_f, padding=8)
+        ttk.Button(body6, text="Wylistuj wszystkich NPC na mapie", command=self._debug_list_npcs).pack(anchor=tk.W)
+        self._debug_accordion_sections.append((btn6, body6))
 
-        # === Prawa kolumna: Procesy (pauza / anuluj) ===
+        # Zwijamy wszystkie oprócz pierwszej i pokazujemy tylko pierwszą
+        for i in range(len(self._debug_accordion_sections)):
+            btn, body = self._debug_accordion_sections[i]
+            body.pack_forget()
+            btn.config(text=("▼ " if i == 0 else "▶ ") + self._debug_accordion_titles[i])
+        self._debug_accordion_sections[0][1].pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+
+        # === Prawa kolumna: Procesy ===
         proc_f = ttk.LabelFrame(right_f, text="Procesy", padding=8)
         proc_f.pack(fill=tk.BOTH, expand=True)
         ttk.Label(proc_f, text="* = wykonywany. Kolejka: najbliższa mapa pierwsza.").pack(anchor=tk.W)
@@ -371,6 +435,77 @@ class MainWindow:
         ttk.Button(proc_btn_f, text="Wykonaj teraz", command=self._process_run_now).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(proc_btn_f, text="Pauzuj", command=self._process_pause_toggle).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(proc_btn_f, text="Anuluj", command=self._process_cancel).pack(side=tk.LEFT)
+
+    def _build_auto_tab(self, parent):
+        """Zakładka Auto: autorozwiązywanie captchy + autoheal z zakresami %."""
+        global _auto_captcha_enabled
+        main_f = ttk.LabelFrame(parent, text="Automaty", padding=10)
+        main_f.pack(fill=tk.X, pady=(0, 10))
+        self._auto_captcha_var = tk.BooleanVar(value=_auto_captcha_enabled)
+        def on_captcha_toggle():
+            global _auto_captcha_enabled
+            _auto_captcha_enabled = self._auto_captcha_var.get()
+        ttk.Checkbutton(
+            main_f,
+            text="Autorozwiązywanie zagadek (captcha) – sprawdzanie co ~2.5 s",
+            variable=self._auto_captcha_var,
+            command=on_captcha_toggle,
+        ).pack(anchor=tk.W)
+        heal_f = ttk.LabelFrame(parent, text="Autoheal (mikstury z ekwipunku)", padding=10)
+        heal_f.pack(fill=tk.X, pady=(0, 10))
+        self._autoheal_var = tk.BooleanVar(value=False)
+        self._autoheal_stop = threading.Event()
+        self._autoheal_thread = None
+        row1 = ttk.Frame(heal_f)
+        row1.pack(anchor=tk.W, pady=(0, 2))
+        ttk.Label(row1, text="Lecz gdy HP poniżej:").pack(side=tk.LEFT, padx=(0, 8))
+        self._heal_below_var = tk.StringVar(value="60")
+        ttk.Spinbox(row1, from_=1, to=99, width=5, textvariable=self._heal_below_var).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(row1, text="%").pack(side=tk.LEFT)
+        row2 = ttk.Frame(heal_f)
+        row2.pack(anchor=tk.W, pady=(2, 0))
+        ttk.Label(row2, text="Zatrzymaj leczenie gdy HP w zakresie:").pack(side=tk.LEFT, padx=(0, 8))
+        self._stop_heal_min_var = tk.StringVar(value="90")
+        ttk.Spinbox(row2, from_=1, to=100, width=5, textvariable=self._stop_heal_min_var).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(row2, text="%").pack(side=tk.LEFT)
+        ttk.Label(row2, text="–").pack(side=tk.LEFT, padx=(4, 4))
+        self._stop_heal_max_var = tk.StringVar(value="100")
+        ttk.Spinbox(row2, from_=1, to=100, width=5, textvariable=self._stop_heal_max_var).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(row2, text="%").pack(side=tk.LEFT)
+        def on_autoheal_toggle():
+            if self._autoheal_var.get():
+                self._autoheal_stop.clear()
+                def loop():
+                    while not self._autoheal_stop.wait(timeout=0.6):
+                        driver = get_driver()
+                        if not driver:
+                            continue
+                        try:
+                            heal_below = int(self._heal_below_var.get().strip() or "60")
+                            stop_min = int(self._stop_heal_min_var.get().strip() or "90")
+                            stop_max = int(self._stop_heal_max_var.get().strip() or "100")
+                        except ValueError:
+                            heal_below, stop_min, stop_max = 60, 90, 100
+                        api = MargonemAPI(
+                            driver,
+                            log_callback=lambda m: self.root.after(0, lambda msg=m: self._log_append(msg)),
+                        )
+                        if api.ensure_context():
+                            api.try_autoheal_tick(
+                                heal_below, stop_min, stop_max,
+                                log_callback=lambda m: self.root.after(0, lambda msg=m: self._log_append(msg)),
+                            )
+                    self.root.after(0, lambda: self._log_append("AutoHeal zatrzymany."))
+                self._autoheal_thread = threading.Thread(target=loop, daemon=True)
+                self._autoheal_thread.start()
+                self._log_append("AutoHeal włączony (lecz < {} %, stop {}-{} %).".format(
+                    self._heal_below_var.get(), self._stop_heal_min_var.get(), self._stop_heal_max_var.get()))
+            else:
+                self._autoheal_stop.set()
+        ttk.Checkbutton(
+            heal_f, text="Włącz autoheal (sprawdzanie co 0.6 s)",
+            variable=self._autoheal_var, command=on_autoheal_toggle,
+        ).pack(anchor=tk.W, pady=(8, 0))
 
     def _debug_refresh_status(self):
         driver = get_driver()
@@ -595,18 +730,75 @@ class MainWindow:
                     if not attack_loop:
                         break
                     if not ok:
-                        # W trybie pętli: zabito wszystkie mobki – czekaj na respawn, chodząc losowo
-                        if not api.wait_for_entity_respawn_while_wandering(
-                            enemy_name,
-                            cancel_check=lambda: cancel_ev.is_set(),
-                            pause_check=lambda: pause_ev.is_set(),
+                        # W trybie pętli: brak mobków – najpierw sąsiednie mapy z tym mobem, potem 15s wander, w kółko
+                        if not self._wait_for_mobs_or_visit_neighbors(
+                            api, enemy_name,
+                            cancel_ev=cancel_ev, pause_ev=pause_ev, log=log,
                         ):
                             break
-                    # ok albo po respawnie – kontynuuj pętlę
+                    # ok albo po respawnie/odwiedzeniu sąsiada – kontynuuj pętlę
                 self.root.after(0, lambda: self._log_append("--- Koniec ataku (pokonano: {}) ---".format(count)))
             finally:
                 self._process_on_finished(process_id)
         threading.Thread(target=work, daemon=True).start()
+
+    def _wait_for_mobs_or_visit_neighbors(self, api, enemy_name, cancel_ev, pause_ev, log):
+        """
+        Gdy brak mobków na mapie: jeśli sąsiednie mapy mają ten mob – idź tam, bij lub chodź 15s i szukaj dalej.
+        Jeśli żaden sąsiad nie ma moba – chodź losowo na obecnej mapie (respawn). Zwraca True gdy moby są.
+        """
+        import random as _random
+        last_visited_map_id = None
+        while True:
+            if cancel_ev.is_set():
+                return False
+            while pause_ev.is_set():
+                time.sleep(0.3)
+                if cancel_ev.is_set():
+                    return False
+            if api.find_npcs_by_name(enemy_name):
+                return True
+            maps_with_mob = get_maps_with_npc(enemy_name)
+            current_id = api.get_current_map_id()
+            if current_id is None:
+                return api.wait_for_entity_respawn_while_wandering(
+                    enemy_name,
+                    cancel_check=lambda: cancel_ev.is_set(),
+                    pause_check=lambda: pause_ev.is_set(),
+                )
+            neighbor_ids = set(str(mid) for mid in get_neighbor_map_ids(current_id))
+            neighbors_with_mob = [m for m in maps_with_mob if str(m[0]) in neighbor_ids]
+            # Opcjonalnie pomiń mapę, z której właśnie przyszliśmy
+            if last_visited_map_id is not None:
+                neighbors_with_mob = [m for m in neighbors_with_mob if str(m[0]) != str(last_visited_map_id)]
+            if not neighbors_with_mob:
+                log("Brak mobków na sąsiednich mapach – chodzę losowo na tej mapie, czekam na respawn.")
+                return api.wait_for_entity_respawn_while_wandering(
+                    enemy_name,
+                    cancel_check=lambda: cancel_ev.is_set(),
+                    pause_check=lambda: pause_ev.is_set(),
+                )
+            next_map = _random.choice(neighbors_with_mob)
+            next_map_id, next_map_name, _ = next_map[0], next_map[1], next_map[2]
+            path = bfs_path(current_id, next_map_id)
+            if not path:
+                continue
+            log("Idę na sąsiednią mapę {} – tam są mobki.".format(next_map_name))
+            if not api.navigate_to_map(path):
+                continue
+            if cancel_ev.is_set():
+                return False
+            last_visited_map_id = current_id
+            if api.find_npcs_by_name(enemy_name):
+                return True
+            log("Na mapie {} brak mobków – chodzę 15 s, potem spróbuję innej sąsiedniej.".format(next_map_name))
+            api.wander_randomly_for_seconds(
+                15,
+                cancel_check=lambda: cancel_ev.is_set(),
+                pause_check=lambda: pause_ev.is_set(),
+            )
+            if cancel_ev.is_set():
+                return False
 
     def _process_run_now(self):
         """Wykonaj teraz: przerwij bieżący i uruchom zaznaczony proces."""
@@ -689,43 +881,66 @@ class MainWindow:
         if not maps_with_npc:
             self._log_append("Brak NPC o nazwie zawierającej '{}' na żadnej mapie.".format(name))
             return
+        if self._current_process_id:
+            self._log_append("Zakończ lub anuluj bieżący proces (atak/rozmowa), potem spróbuj ponownie.")
+            return
+        process_id = str(uuid.uuid4())[:8]
+        cancel_ev = threading.Event()
+        pause_ev = threading.Event()
+        display_name = "Rozmowa: {}".format(name)
+        self._processes[process_id] = {"name": display_name, "cancel": cancel_ev, "pause": pause_ev}
+        self._current_process_id = process_id
+        self._process_refresh_listbox()
         self._log_append("--- Rozmowa z: '{}' (znaleziono na {} mapach) ---".format(name, len(maps_with_npc)))
         def work():
             def log(m):
                 self.root.after(0, lambda msg=m: self._log_append(msg))
-            api = MargonemAPI(
-                driver,
-                log_callback=log,
-                captcha_check=lambda d: check_and_solve_captcha_once(d, log_callback=log),
-            )
-            if not api.ensure_context():
-                self.root.after(0, lambda: self._log_append("Debug: Engine niedostępny – wejdź na postać."))
-                return
-            current_id = api.get_current_map_id()
-            current_norm = str(current_id) if current_id is not None else None
-            map_ids = [m[0] for m in maps_with_npc]
-            if current_norm in map_ids:
-                log("Jesteś na mapie z tym NPC – rozmawiam.")
-                ok = api.talk_to_entity_by_name(name, timeout_sec=45)
-                self.root.after(0, lambda: self._log_append("--- Koniec rozmowy (sukces={}) ---".format(ok)))
-                return
-            best_map_id, best_name, _ = None, None, None
-            best_len = 9999
-            for map_id, map_name, _ in maps_with_npc:
-                path = bfs_path(current_id, map_id)
-                if path is not None and len(path) < best_len:
-                    best_len = len(path)
-                    best_map_id, best_name = map_id, map_name
-            if best_map_id is None:
-                self.root.after(0, lambda: self._log_append("Brak ścieżki do żadnej mapy z tym NPC."))
-                return
-            log("Idę na mapę {} ({} przejść), potem rozmowa.".format(best_name, best_len))
-            path = bfs_path(current_id, best_map_id)
-            if not api.navigate_to_map(path):
-                self.root.after(0, lambda: self._log_append("--- Nie udało się dojść na mapę ---"))
-                return
-            ok = api.talk_to_entity_by_name(name, timeout_sec=45)
-            self.root.after(0, lambda: self._log_append("--- Koniec rozmowy (sukces={}) ---".format(ok)))
+            try:
+                if cancel_ev.is_set():
+                    return
+                api = MargonemAPI(
+                    driver,
+                    log_callback=log,
+                    captcha_check=lambda d: check_and_solve_captcha_once(d, log_callback=log),
+                )
+                if not api.ensure_context():
+                    self.root.after(0, lambda: self._log_append("Debug: Engine niedostępny – wejdź na postać."))
+                    return
+                while pause_ev.is_set() and not cancel_ev.is_set():
+                    time.sleep(0.3)
+                if cancel_ev.is_set():
+                    return
+                current_id = api.get_current_map_id()
+                current_norm = str(current_id) if current_id is not None else None
+                map_ids = [str(m[0]) for m in maps_with_npc]
+                if current_norm in map_ids:
+                    log("Jesteś na mapie z tym NPC – rozmawiam.")
+                    api.talk_to_entity_by_name(name, timeout_sec=45)
+                    self.root.after(0, lambda: self._log_append("--- Koniec rozmowy ---"))
+                    return
+                best_map_id, best_name, _ = None, None, None
+                best_len = 9999
+                for map_id, map_name, _ in maps_with_npc:
+                    path = bfs_path(current_id, map_id)
+                    if path is not None and len(path) < best_len:
+                        best_len = len(path)
+                        best_map_id, best_name = map_id, map_name
+                if best_map_id is None:
+                    self.root.after(0, lambda: self._log_append("Brak ścieżki do żadnej mapy z tym NPC."))
+                    return
+                log("Idę na mapę {} ({} przejść), potem rozmowa.".format(best_name, best_len))
+                path = bfs_path(current_id, best_map_id)
+                if cancel_ev.is_set():
+                    return
+                if not api.navigate_to_map(path):
+                    self.root.after(0, lambda: self._log_append("--- Nie udało się dojść na mapę ---"))
+                    return
+                if cancel_ev.is_set():
+                    return
+                api.talk_to_entity_by_name(name, timeout_sec=45)
+                self.root.after(0, lambda: self._log_append("--- Koniec rozmowy ---"))
+            finally:
+                self._process_on_finished(process_id)
         threading.Thread(target=work, daemon=True).start()
 
     def _debug_filter_maps(self):

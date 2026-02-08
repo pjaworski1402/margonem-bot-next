@@ -174,6 +174,17 @@ def bfs_distances(start_map_id):
     return dist
 
 
+def get_neighbor_map_ids(map_id):
+    """
+    Zwraca listę ID map bezpośrednio sąsiadujących z map_id (jedno przejście bramą).
+    """
+    _load_maps()
+    mid = _normalize_id(map_id)
+    if mid not in _graph:
+        return []
+    return [next_id for _gw_id, next_id in _graph[mid]]
+
+
 def get_maps_with_npc(name_substring):
     """
     Zwraca listę map, na których występuje NPC o nazwie zawierającej name_substring.
