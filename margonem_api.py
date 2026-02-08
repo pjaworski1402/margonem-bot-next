@@ -4,6 +4,7 @@ API Margonem – mapa komend i obiektów z docs.md na klasę Pythona.
 Użycie: api = MargonemAPI(driver); api.ensure_context(); api.hero.get_position()
 Wszystkie metody przyjmują driver (Selenium) i wykonują execute_script w kontekście gry.
 """
+import random
 import time
 from game_context import ensure_game_context, is_engine_ready
 
@@ -291,6 +292,68 @@ class MargonemAPI:
                 best = n
         return best
 
+    def wait_for_entity_respawn_while_wandering(
+        self,
+        name_substring,
+        check_interval=0.5,
+        single_walk_timeout_sec=8,
+        cancel_check=None,
+        pause_check=None,
+    ):
+        """
+        Czeka, aż na mapie pojawią się znowu postacie o nazwie zawierającej name_substring.
+        W międzyczasie chodzi losowo po mapie (nie stoi w miejscu).
+        cancel_check: callable() -> True aby przerwać (np. lambda: ev.is_set()).
+        pause_check: callable() -> True gdy pauza (wtedy tylko czeka).
+        Zwraca True gdy cele są na mapie, False gdy anulowano.
+        """
+        while True:
+            if cancel_check and cancel_check():
+                return False
+            while pause_check and pause_check():
+                time.sleep(0.3)
+                if cancel_check and cancel_check():
+                    return False
+            mobs = self.find_npcs_by_name(name_substring)
+            if mobs:
+                self.log("Pojawiły się cele ({} szt.) – wznawiam atak.".format(len(mobs)))
+                return True
+            self.log("Brak celów na mapie – chodzę losowo, czekam na respawn.")
+            mi = self.get_map_info()
+            sx = mi.get("size_x")
+            sy = mi.get("size_y")
+            pos = self.get_hero_position()
+            if sx and sy and sx > 4 and sy > 4:
+                rx = random.randint(2, max(2, int(sx) - 2))
+                ry = random.randint(2, max(2, int(sy) - 2))
+            elif pos:
+                rx = max(0, pos[0] + random.randint(-4, 4))
+                ry = max(0, pos[1] + random.randint(-4, 4))
+            else:
+                time.sleep(check_interval)
+                continue
+            if not self.can_act():
+                time.sleep(check_interval)
+                continue
+            self.hero_auto_go_to(rx, ry)
+            deadline = time.time() + single_walk_timeout_sec
+            while time.time() < deadline:
+                if cancel_check and cancel_check():
+                    return False
+                while pause_check and pause_check():
+                    time.sleep(0.3)
+                    if cancel_check and cancel_check():
+                        return False
+                mobs = self.find_npcs_by_name(name_substring)
+                if mobs:
+                    self.log("Pojawiły się cele – wznawiam atak.")
+                    return True
+                pos = self.get_hero_position()
+                if pos and self._distance_manhattan(pos[0], pos[1], rx, ry) <= 2:
+                    break
+                time.sleep(check_interval)
+            time.sleep(0.3)
+
     # --- Locks (Engine.lock) ---
 
     def is_locked(self, lock_type=None):
@@ -474,6 +537,7 @@ class MargonemAPI:
         """
         Wspólna logika: znajdź najbliższego NPC po nazwie, idź do niego sprawdzając co chwilę pozycję,
         gdy postać będzie kratkę od celu – wykonaj do_callback(npc_dict).
+        Co każdą iterację sprawdza, czy cel nadal jest na mapie (ktoś mógł go zabić w międzyczasie).
         do_callback dostaje {id, x, y, nick}.
         """
         self.ensure_context()
@@ -499,22 +563,25 @@ class MargonemAPI:
                 self.log("W zasięgu – wykonuję: {}.".format(action_name))
                 do_callback(target)
                 return True
-            # Odśwież pozycję celu (NPC może się ruszyć)
+            # Odśwież pozycję celu i sprawdź, czy cel nadal jest na mapie (mógł zostać zabity)
             t = self.get_npc_by_id(target["id"])
-            if t:
-                tx, ty = t["x"], t["y"]
+            if t is None:
+                self.log("Cel '{}' zniknął z mapy (zabity?) – przerywam.".format(name_substring))
+                return False
+            tx, ty = t["x"], t["y"]
             self.hero_auto_go_to(tx, ty)
             time.sleep(check_interval)
         self.log("Timeout przed wykonaniem: {}.".format(action_name))
         return False
 
-    def attack_entity_by_name(self, name_substring, timeout_sec=30, fast_fight=True):
+    def attack_entity_by_name(self, name_substring, timeout_sec=30, fast_fight=True, cooldown_after_attack_sec=3):
         """
         Znajdź najbliższą postać o nazwie zawierającej name_substring, podejdź na kratkę;
-        gdy w zasięgu – atak z ff=1 (szybka walka bez okna lootu i zamykania).
+        gdy w zasięgu – atak z ff=1. Po ataku czeka cooldown_after_attack_sec (domyślnie 3 s).
         """
         def do_attack(npc):
             self.fight_attack(npc["id"], fast_fight=fast_fight)
+            time.sleep(cooldown_after_attack_sec)
         return self._go_to_entity_and_do(
             name_substring, "atak", do_attack,
             timeout_sec=timeout_sec,

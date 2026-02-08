@@ -9,10 +9,17 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 import threading
+import uuid
 
 import config_credentials as creds
 from margonem_api import MargonemAPI
-from maps_graph import find_map_ids_by_name, bfs_path, get_map_name_by_id
+from maps_graph import (
+    find_map_ids_by_name,
+    bfs_path,
+    get_map_name_by_id,
+    get_maps_with_npc,
+    get_maps_with_npc_by_distance,
+)
 from captcha_solver import check_and_solve_captcha_once, ensure_no_captcha
 
 # Import przeglądarki dopiero przy uruchomieniu
@@ -248,15 +255,27 @@ class MainWindow:
         self._log.pack(fill=tk.BOTH, expand=True)
 
     def _build_debug_tab(self, parent):
+        self._processes = {}  # process_id -> {name, cancel, pause, target_map_id, target_map_name, enemy_name, attack_loop}
+        self._process_queue = []  # kolejka process_id (tylko ataki)
+        self._current_process_id = None  # aktualnie wykonywany (gwiazdka)
+
+        paned = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+        left_f = ttk.Frame(paned, padding=(0, 0, 8, 0))
+        paned.add(left_f, weight=1)
+        right_f = ttk.Frame(paned, width=220)
+        paned.add(right_f, weight=0)
+
+        # === Lewa kolumna: dotychczasowa zawartość Debug ===
         # Status (odśwież)
-        status_f = ttk.LabelFrame(parent, text="Status gry", padding=8)
+        status_f = ttk.LabelFrame(left_f, text="Status gry", padding=8)
         status_f.pack(fill=tk.X, pady=(0, 8))
         self._debug_status_text = tk.StringVar(value="Kliknij 'Odśwież status', gdy postać jest w grze.")
         ttk.Label(status_f, textvariable=self._debug_status_text).pack(anchor=tk.W)
         ttk.Button(status_f, text="Odśwież status", command=self._debug_refresh_status).pack(anchor=tk.W, pady=(4, 0))
 
         # Idź do (x, y)
-        go_f = ttk.LabelFrame(parent, text="Idź do pozycji (x, y)", padding=8)
+        go_f = ttk.LabelFrame(left_f, text="Idź do pozycji (x, y)", padding=8)
         go_f.pack(fill=tk.X, pady=(0, 8))
         row = ttk.Frame(go_f)
         row.pack(anchor=tk.W)
@@ -268,17 +287,42 @@ class MainWindow:
         ttk.Entry(row, textvariable=self._debug_y_var, width=6).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Button(row, text="Idź", command=self._debug_go_xy).pack(side=tk.LEFT)
 
-        # Atakuj NPC po nazwie
-        atk_f = ttk.LabelFrame(parent, text="Atakuj postać/NPC (po nazwie)", padding=8)
-        atk_f.pack(fill=tk.X, pady=(0, 8))
+        # Atak – mapy z przeciwnikami (pogrupowane wg odległości) + scroll
+        atk_f = ttk.LabelFrame(left_f, text="Atak – wybierz mapę z przeciwnikami", padding=8)
+        atk_f.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         row_atk = ttk.Frame(atk_f)
-        row_atk.pack(anchor=tk.W)
+        row_atk.pack(fill=tk.X)
+        ttk.Label(row_atk, text="Nazwa przeciwnika:").pack(side=tk.LEFT, padx=(0, 6))
         self._debug_attack_name_var = tk.StringVar(value="Szczur")
-        ttk.Entry(row_atk, textvariable=self._debug_attack_name_var, width=24).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(row_atk, text="Atakuj (podejdź i atakuj)", command=self._debug_attack_by_name).pack(side=tk.LEFT)
+        ttk.Entry(row_atk, textvariable=self._debug_attack_name_var, width=20).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(row_atk, text="Szukaj map", command=self._debug_attack_search_maps).pack(side=tk.LEFT, padx=(0, 12))
+        self._debug_attack_loop_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(atk_f, text="Bij w pętli (pokonaj jednego → idź do następnego, w kółko)", variable=self._debug_attack_loop_var).pack(anchor=tk.W, pady=(4, 0))
+        # Obszar ze scrollem (Canvas + Scrollbar)
+        atk_scroll_f = ttk.Frame(atk_f)
+        atk_scroll_f.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        self._attack_maps_scrollbar = ttk.Scrollbar(atk_scroll_f)
+        self._attack_maps_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._attack_maps_canvas = tk.Canvas(
+            atk_scroll_f,
+            yscrollcommand=self._attack_maps_scrollbar.set,
+            highlightthickness=0,
+        )
+        self._attack_maps_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._attack_maps_scrollbar.config(command=self._attack_maps_canvas.yview)
+        self._attack_maps_container = ttk.Frame(self._attack_maps_canvas)
+        self._attack_maps_canvas_window = self._attack_maps_canvas.create_window((0, 0), window=self._attack_maps_container, anchor=tk.NW)
+        def _on_attack_maps_frame_configure(e):
+            self._attack_maps_canvas.configure(scrollregion=self._attack_maps_canvas.bbox("all"))
+        def _on_attack_maps_canvas_configure(e):
+            self._attack_maps_canvas.itemconfig(self._attack_maps_canvas_window, width=e.width)
+        self._attack_maps_container.bind("<Configure>", _on_attack_maps_frame_configure)
+        self._attack_maps_canvas.bind("<Configure>", _on_attack_maps_canvas_configure)
+        self._attack_maps_canvas.bind("<MouseWheel>", lambda e: self._attack_maps_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        ttk.Label(self._attack_maps_container, text="Wpisz nazwę i kliknij „Szukaj map” – klik w mapę: idź tam i atakuj najbliższego przeciwnika.").pack(anchor=tk.W)
 
         # Rozmawiaj z NPC po nazwie
-        talk_f = ttk.LabelFrame(parent, text="Rozmawiaj z NPC (po nazwie)", padding=8)
+        talk_f = ttk.LabelFrame(left_f, text="Rozmawiaj z NPC (po nazwie)", padding=8)
         talk_f.pack(fill=tk.X, pady=(0, 8))
         row_talk = ttk.Frame(talk_f)
         row_talk.pack(anchor=tk.W)
@@ -287,7 +331,7 @@ class MainWindow:
         ttk.Button(row_talk, text="Podejdź i rozmawiaj", command=self._debug_talk_by_name).pack(side=tk.LEFT)
 
         # Idź na mapę (BFS)
-        nav_f = ttk.LabelFrame(parent, text="Idź na mapę (ścieżka BFS)", padding=8)
+        nav_f = ttk.LabelFrame(left_f, text="Idź na mapę (ścieżka BFS)", padding=8)
         nav_f.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         ttk.Label(nav_f, text="Obecna mapa odczytana przy starcie nawigacji.").pack(anchor=tk.W)
         row_search = ttk.Frame(nav_f)
@@ -310,9 +354,23 @@ class MainWindow:
         self._debug_filter_maps()
 
         # Lista NPC
-        list_f = ttk.LabelFrame(parent, text="Mapa / NPC", padding=8)
+        list_f = ttk.LabelFrame(left_f, text="Mapa / NPC", padding=8)
         list_f.pack(fill=tk.X, pady=(0, 8))
         ttk.Button(list_f, text="Wylistuj wszystkich NPC na mapie", command=self._debug_list_npcs).pack(anchor=tk.W)
+
+        # === Prawa kolumna: Procesy (pauza / anuluj) ===
+        proc_f = ttk.LabelFrame(right_f, text="Procesy", padding=8)
+        proc_f.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(proc_f, text="* = wykonywany. Kolejka: najbliższa mapa pierwsza.").pack(anchor=tk.W)
+        proc_list_frame = ttk.Frame(proc_f)
+        proc_list_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 6))
+        self._process_listbox = tk.Listbox(proc_list_frame, height=12, font=("Consolas", 9), selectmode=tk.SINGLE)
+        self._process_listbox.pack(fill=tk.BOTH, expand=True)
+        proc_btn_f = ttk.Frame(proc_f)
+        proc_btn_f.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(proc_btn_f, text="Wykonaj teraz", command=self._process_run_now).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(proc_btn_f, text="Pauzuj", command=self._process_pause_toggle).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(proc_btn_f, text="Anuluj", command=self._process_cancel).pack(side=tk.LEFT)
 
     def _debug_refresh_status(self):
         driver = get_driver()
@@ -357,28 +415,266 @@ class MainWindow:
         api.go_to_xy(x, y)
         self._log_append("Wysłano: Idź do ({}, {}).".format(x, y))
 
-    def _debug_attack_by_name(self):
+    def _debug_attack_search_maps(self):
         name = (self._debug_attack_name_var.get() or "").strip()
         if not name:
-            self._log_append("Debug: Podaj nazwę postaci do ataku.")
+            self._log_append("Debug: Podaj nazwę przeciwnika.")
             return
         driver = get_driver()
         if not driver:
             messagebox.showwarning("Uwaga", "Najpierw uruchom przeglądarkę i wejdź do gry.", parent=self.root)
             return
-        self._log_append("--- Atakuj: '{}' ---".format(name))
+        self._log_append("Szukam map z przeciwnikiem '{}'...".format(name))
+        def work():
+            api = MargonemAPI(driver, log_callback=lambda m: self.root.after(0, lambda msg=m: self._log_append(msg)))
+            if not api.ensure_context():
+                self.root.after(0, lambda: self._log_append("Engine niedostępny – wejdź na postać."))
+                return
+            current_id = api.get_current_map_id()
+            current_norm = str(current_id) if current_id is not None else None
+            groups = get_maps_with_npc_by_distance(name, current_id)
+            self.root.after(0, lambda: self._fill_attack_maps(current_norm, groups, name))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _fill_attack_maps(self, current_map_id, groups, enemy_name):
+        """Wypełnia kontener przyciskami map pogrupowanymi wg odległości."""
+        for w in self._attack_maps_container.winfo_children():
+            w.destroy()
+        if not groups:
+            ttk.Label(self._attack_maps_container, text="Brak map z tym przeciwnikiem.").pack(anchor=tk.W)
+            return
+        for label, maps_list in groups:
+            grp_f = ttk.LabelFrame(self._attack_maps_container, text=label, padding=4)
+            grp_f.pack(fill=tk.X, pady=(0, 6))
+            row = ttk.Frame(grp_f)
+            row.pack(anchor=tk.W)
+            for map_id, map_name, count in maps_list:
+                is_current = (str(map_id) == current_map_id)
+                btn_text = "{} ({}) [TU JESTEŚ]".format(map_name, count) if is_current else "{} ({})".format(map_name, count)
+                btn = ttk.Button(
+                    row,
+                    text=btn_text,
+                    command=lambda mid=map_id, mname=map_name, ename=enemy_name: self._debug_attack_go_to_map(mid, mname, ename),
+                )
+                btn.pack(side=tk.LEFT, padx=(0, 6), pady=2)
+        self._attack_maps_canvas.update_idletasks()
+        self._attack_maps_canvas.configure(scrollregion=self._attack_maps_canvas.bbox("all"))
+
+    def _process_refresh_listbox(self):
+        """Lista: najpierw aktualny (z *), potem kolejka."""
+        self._process_listbox.delete(0, tk.END)
+        if self._current_process_id and self._current_process_id in self._processes:
+            self._process_listbox.insert(tk.END, "* " + self._processes[self._current_process_id]["name"])
+        for pid in self._process_queue:
+            if pid in self._processes:
+                self._process_listbox.insert(tk.END, "  " + self._processes[pid]["name"])
+
+    def _process_get_selected_id(self):
+        sel = self._process_listbox.curselection()
+        if not sel:
+            return None
+        i = sel[0]
+        if self._current_process_id is not None:
+            if i == 0:
+                return self._current_process_id
+            i -= 1
+        if i < len(self._process_queue):
+            return self._process_queue[i]
+        return None
+
+    def _process_remove(self, process_id):
+        """Usuwa proces (z kolejki i słownika)."""
+        if process_id in self._process_queue:
+            self._process_queue.remove(process_id)
+        if process_id == self._current_process_id:
+            self._current_process_id = None
+        if process_id in self._processes:
+            del self._processes[process_id]
+        self.root.after(0, self._process_refresh_listbox)
+
+    def _process_on_finished(self, process_id):
+        """Wywołane gdy wątek procesu się kończy."""
+        if process_id == self._current_process_id:
+            self._current_process_id = None
+        if process_id in self._processes:
+            del self._processes[process_id]
+        self.root.after(0, self._process_refresh_listbox)
+        self._process_worker_pick_next()
+
+    def _process_worker_pick_next(self):
+        """Wybiera z kolejki proces z najbliższą mapą i uruchamia go."""
+        if self._current_process_id is not None or not self._process_queue:
+            self.root.after(0, self._process_refresh_listbox)
+            return
+        def pick_and_run():
+            driver = get_driver()
+            if not driver:
+                self.root.after(0, self._process_refresh_listbox)
+                return
+            api = MargonemAPI(driver, log_callback=lambda m: self.root.after(0, lambda msg=m: self._log_append(msg)))
+            if not api.ensure_context():
+                self.root.after(0, self._process_refresh_listbox)
+                return
+            current_map_id = api.get_current_map_id()
+            best_pid, best_dist = None, 9999
+            for pid in self._process_queue:
+                if pid not in self._processes:
+                    continue
+                tid = self._processes[pid].get("target_map_id")
+                path = bfs_path(current_map_id, tid) if tid else None
+                d = len(path) if path is not None else 9999
+                if d < best_dist:
+                    best_dist = d
+                    best_pid = pid
+            if best_pid is None:
+                self.root.after(0, self._process_refresh_listbox)
+                return
+            self._process_queue.remove(best_pid)
+            self._current_process_id = best_pid
+            self.root.after(0, self._process_refresh_listbox)
+            self._run_attack_process(best_pid)
+        threading.Thread(target=pick_and_run, daemon=True).start()
+
+    def _run_attack_process(self, process_id):
+        """Wykonuje jeden proces ataku (nawigacja + pętla ataków)."""
+        if process_id not in self._processes:
+            return
+        p = self._processes[process_id]
+        driver = get_driver()
+        if not driver:
+            self._process_on_finished(process_id)
+            return
+        target_map_id = p["target_map_id"]
+        target_map_name = p["target_map_name"]
+        enemy_name = p["enemy_name"]
+        attack_loop = p["attack_loop"]
+        cancel_ev = p["cancel"]
+        pause_ev = p["pause"]
+
         def work():
             def log(m):
                 self.root.after(0, lambda msg=m: self._log_append(msg))
-            api = MargonemAPI(
-                driver,
-                log_callback=log,
-                captcha_check=lambda d: check_and_solve_captcha_once(d, log_callback=log),
-            )
-            api.ensure_context()
-            ok = api.attack_entity_by_name(name, timeout_sec=45)
-            self.root.after(0, lambda: self._log_append("--- Koniec ataku (sukces={}) ---".format(ok)))
+            try:
+                if cancel_ev.is_set():
+                    return
+                api = MargonemAPI(
+                    driver,
+                    log_callback=log,
+                    captcha_check=lambda d: check_and_solve_captcha_once(d, log_callback=log),
+                )
+                if not api.ensure_context():
+                    self.root.after(0, lambda: self._log_append("Engine niedostępny."))
+                    return
+                if cancel_ev.is_set():
+                    return
+                current_id = api.get_current_map_id()
+                if current_id is not None and str(current_id) != str(target_map_id):
+                    path = bfs_path(current_id, target_map_id)
+                    if path is None:
+                        self.root.after(0, lambda: self._log_append("Brak ścieżki do mapy {}.".format(target_map_name)))
+                        return
+                    ok = api.navigate_to_map(path)
+                    self.root.after(0, lambda: self._log_append("Dojście na mapę (sukces={}).".format(ok)))
+                    if not ok:
+                        return
+                count = 0
+                while True:
+                    if cancel_ev.is_set():
+                        log("Atak anulowany.")
+                        break
+                    while pause_ev.is_set():
+                        time.sleep(0.3)
+                        if cancel_ev.is_set():
+                            break
+                    if cancel_ev.is_set():
+                        break
+                    log("Atakuję najbliższego '{}'...".format(enemy_name))
+                    ok = api.attack_entity_by_name(enemy_name, timeout_sec=45)
+                    if ok:
+                        count += 1
+                    if not attack_loop:
+                        break
+                    if not ok:
+                        # W trybie pętli: zabito wszystkie mobki – czekaj na respawn, chodząc losowo
+                        if not api.wait_for_entity_respawn_while_wandering(
+                            enemy_name,
+                            cancel_check=lambda: cancel_ev.is_set(),
+                            pause_check=lambda: pause_ev.is_set(),
+                        ):
+                            break
+                    # ok albo po respawnie – kontynuuj pętlę
+                self.root.after(0, lambda: self._log_append("--- Koniec ataku (pokonano: {}) ---".format(count)))
+            finally:
+                self._process_on_finished(process_id)
         threading.Thread(target=work, daemon=True).start()
+
+    def _process_run_now(self):
+        """Wykonaj teraz: przerwij bieżący i uruchom zaznaczony proces."""
+        pid = self._process_get_selected_id()
+        if not pid or pid not in self._processes:
+            return
+        if pid == self._current_process_id:
+            self._log_append("Ten proces już jest wykonywany.")
+            return
+        if self._current_process_id:
+            self._processes[self._current_process_id]["cancel"].set()
+            self._log_append("Przerwano bieżący proces.")
+        if pid in self._process_queue:
+            self._process_queue.remove(pid)
+        self._current_process_id = pid
+        self._process_refresh_listbox()
+        self._run_attack_process(pid)
+
+    def _process_pause_toggle(self):
+        pid = self._process_get_selected_id()
+        if not pid or pid not in self._processes:
+            return
+        p = self._processes[pid]
+        if p["pause"].is_set():
+            p["pause"].clear()
+            self._log_append("Proces wznowiony.")
+        else:
+            p["pause"].set()
+            self._log_append("Proces wstrzymany (pauza).")
+
+    def _process_cancel(self):
+        pid = self._process_get_selected_id()
+        if not pid or pid not in self._processes:
+            return
+        if pid in self._process_queue:
+            self._process_queue.remove(pid)
+            self._process_remove(pid)
+            self._log_append("Usunięto z kolejki.")
+        else:
+            self._processes[pid]["cancel"].set()
+            self._log_append("Anulowano (zakończy się przy najbliższej okazji).")
+
+    def _debug_attack_go_to_map(self, target_map_id, target_map_name, enemy_name):
+        """Dodaje atak do kolejki procesów (najbliższa mapa wykonywana pierwsza)."""
+        driver = get_driver()
+        if not driver:
+            messagebox.showwarning("Uwaga", "Najpierw uruchom przeglądarkę i wejdź do gry.", parent=self.root)
+            return
+        attack_loop = self._debug_attack_loop_var.get()
+        display_name = "Atak: {} na {}".format(enemy_name, target_map_name)
+        if attack_loop:
+            display_name += " [pętla]"
+        process_id = str(uuid.uuid4())[:8]
+        cancel_ev = threading.Event()
+        pause_ev = threading.Event()
+        self._processes[process_id] = {
+            "name": display_name,
+            "cancel": cancel_ev,
+            "pause": pause_ev,
+            "target_map_id": target_map_id,
+            "target_map_name": target_map_name,
+            "enemy_name": enemy_name,
+            "attack_loop": attack_loop,
+        }
+        self._process_queue.append(process_id)
+        self._process_refresh_listbox()
+        self._log_append("Dodano do kolejki: {}.".format(display_name))
+        self._process_worker_pick_next()
 
     def _debug_talk_by_name(self):
         name = (self._debug_talk_name_var.get() or "").strip()
@@ -389,7 +685,11 @@ class MainWindow:
         if not driver:
             messagebox.showwarning("Uwaga", "Najpierw uruchom przeglądarkę i wejdź do gry.", parent=self.root)
             return
-        self._log_append("--- Rozmowa z: '{}' ---".format(name))
+        maps_with_npc = get_maps_with_npc(name)
+        if not maps_with_npc:
+            self._log_append("Brak NPC o nazwie zawierającej '{}' na żadnej mapie.".format(name))
+            return
+        self._log_append("--- Rozmowa z: '{}' (znaleziono na {} mapach) ---".format(name, len(maps_with_npc)))
         def work():
             def log(m):
                 self.root.after(0, lambda msg=m: self._log_append(msg))
@@ -398,7 +698,32 @@ class MainWindow:
                 log_callback=log,
                 captcha_check=lambda d: check_and_solve_captcha_once(d, log_callback=log),
             )
-            api.ensure_context()
+            if not api.ensure_context():
+                self.root.after(0, lambda: self._log_append("Debug: Engine niedostępny – wejdź na postać."))
+                return
+            current_id = api.get_current_map_id()
+            current_norm = str(current_id) if current_id is not None else None
+            map_ids = [m[0] for m in maps_with_npc]
+            if current_norm in map_ids:
+                log("Jesteś na mapie z tym NPC – rozmawiam.")
+                ok = api.talk_to_entity_by_name(name, timeout_sec=45)
+                self.root.after(0, lambda: self._log_append("--- Koniec rozmowy (sukces={}) ---".format(ok)))
+                return
+            best_map_id, best_name, _ = None, None, None
+            best_len = 9999
+            for map_id, map_name, _ in maps_with_npc:
+                path = bfs_path(current_id, map_id)
+                if path is not None and len(path) < best_len:
+                    best_len = len(path)
+                    best_map_id, best_name = map_id, map_name
+            if best_map_id is None:
+                self.root.after(0, lambda: self._log_append("Brak ścieżki do żadnej mapy z tym NPC."))
+                return
+            log("Idę na mapę {} ({} przejść), potem rozmowa.".format(best_name, best_len))
+            path = bfs_path(current_id, best_map_id)
+            if not api.navigate_to_map(path):
+                self.root.after(0, lambda: self._log_append("--- Nie udało się dojść na mapę ---"))
+                return
             ok = api.talk_to_entity_by_name(name, timeout_sec=45)
             self.root.after(0, lambda: self._log_append("--- Koniec rozmowy (sukces={}) ---".format(ok)))
         threading.Thread(target=work, daemon=True).start()

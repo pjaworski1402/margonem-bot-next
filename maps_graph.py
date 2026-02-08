@@ -151,3 +151,83 @@ def bfs_path(start_map_id, target_map_id):
                 return path
             queue.append(next_id)
     return None
+
+
+def bfs_distances(start_map_id):
+    """
+    BFS od start_map_id: zwraca dict map_id -> odległość (liczba przejść).
+    Tylko mapy osiągalne z start.
+    """
+    _load_maps()
+    start = _normalize_id(start_map_id)
+    if start not in _graph:
+        return {}
+    dist = {start: 0}
+    queue = deque([start])
+    while queue:
+        current = queue.popleft()
+        d = dist[current]
+        for _gw_id, next_id in _graph.get(current, []):
+            if next_id not in dist:
+                dist[next_id] = d + 1
+                queue.append(next_id)
+    return dist
+
+
+def get_maps_with_npc(name_substring):
+    """
+    Zwraca listę map, na których występuje NPC o nazwie zawierającej name_substring.
+    Każdy element: (map_id, map_name, total_count) – total_count to suma pól count
+    ze wszystkich wpisów NPC na tej mapie pasujących do nazwy.
+    """
+    _load_maps()
+    part = (name_substring or "").strip().lower()
+    if not part:
+        return []
+    out = []
+    for mid, info in _maps_data.items():
+        map_name = (info.get("name") or "").strip() or mid
+        npcs = info.get("npcs") or []
+        total = 0
+        for n in npcs:
+            nname = (n.get("name") or "").strip().lower()
+            if part in nname:
+                total += int(n.get("count") or 0)
+        if total > 0:
+            out.append((mid, map_name, total))
+    return sorted(out, key=lambda x: (-x[2], x[1].lower()))
+
+
+def get_maps_with_npc_by_distance(name_substring, current_map_id):
+    """
+    Jak get_maps_with_npc, ale pogrupowane wg odległości BFS od current_map_id.
+    Zwraca listę (etykieta_grupy, lista (map_id, map_name, count)):
+    [ ("Na tej mapie", [(mid, name, count), ...]),
+      ("1 przejście", [...]),
+      ("2 przejścia", [...]), ... ]
+    """
+    maps_with_npc = get_maps_with_npc(name_substring)
+    if not maps_with_npc:
+        return []
+    current = _normalize_id(current_map_id)
+    dist_map = bfs_distances(current) if current else {}
+    by_dist = {}  # distance -> [(map_id, map_name, count), ...]
+    for mid, map_name, count in maps_with_npc:
+        d = dist_map.get(mid)
+        if d is None:
+            d = 9999
+        if d not in by_dist:
+            by_dist[d] = []
+        by_dist[d].append((mid, map_name, count))
+    result = []
+    for d in sorted(by_dist.keys()):
+        if d == 0:
+            label = "Na tej mapie"
+        elif d == 1:
+            label = "1 przejście"
+        elif 2 <= d <= 4:
+            label = "{} przejścia".format(d)
+        else:
+            label = "{} przejść".format(d)
+        result.append((label, by_dist[d]))
+    return result
